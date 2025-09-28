@@ -5,22 +5,18 @@
       "maxDuration": 30
     }
   },
+  "outputDirectory": "frontend/public",
   "routes": [
     {
       "src": "/api/(.*)",
       "dest": "/api/index.js"
     },
     {
-      "src": "^/static/(.*)",
-      "dest": "/frontend/public/static/$1"
-    },
-    {
-      "src": "^/(login|home|dashboard|packages|borrow|return|history)/?$",
-      "dest": "/frontend/public/index.html"
+      "handle": "filesystem"
     },
     {
       "src": "/(.*)",
-      "dest": "/frontend/public/$1"
+      "dest": "/index.html"
     }
   ],
   "env": {
