@@ -596,11 +596,11 @@ cron.schedule('0 */2 * * *', async () => {
   }
 });
 
-// For Vercel deployment
-if (process.env.VERCEL) {
-  module.exports = app;
-} else {
-  // For local development
+// Export the Express app so serverless platforms (like Vercel) can use it.
+module.exports = app;
+
+// If this file is run directly (node server.js), start the HTTP server.
+if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
