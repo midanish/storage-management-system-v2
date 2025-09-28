@@ -16,7 +16,7 @@
       "dest": "/api/index.js"
     },
     {
-      "src": "/static/(.*)",
+      "src": "/(.*)",
       "dest": "/frontend/public/$1"
     },
     {
