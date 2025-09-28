@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
@@ -14,6 +15,18 @@ const PORT = process.env.PORT || 3000;
 
 // Trust proxy for correct IP handling with Vercel
 app.set('trust proxy', 1);
+
+// Enable compression for all responses
+app.use(compression({
+  level: 6,
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -32,7 +45,13 @@ app.use(helmet({
 }));
 app.use(cors());
 app.use(express.json());
-app.use(express.static('frontend/public'));
+
+// Serve static files with optimized caching
+app.use(express.static('frontend/public', {
+  maxAge: '1d',
+  etag: true,
+  lastModified: true
+}));
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -147,7 +166,13 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/packages', authenticateToken, async (req, res) => {
   try {
-    const [packages] = await pool.execute('SELECT * FROM package ORDER BY ID DESC');
+    // Add caching headers and optimize query
+    res.set({
+      'Cache-Control': 'public, max-age=30',
+      'ETag': `packages-${Date.now()}`
+    });
+
+    const [packages] = await pool.execute('SELECT * FROM package ORDER BY ID DESC LIMIT 1000');
     res.json(packages);
   } catch (error) {
     console.error('Get packages error:', error);
@@ -157,9 +182,22 @@ app.get('/api/packages', authenticateToken, async (req, res) => {
 
 app.get('/api/packages/options', authenticateToken, async (req, res) => {
   try {
-    const [categories] = await pool.execute('SELECT DISTINCT Category FROM package WHERE Category IS NOT NULL');
-    const [shifts] = await pool.execute('SELECT DISTINCT `SampleCreatedByShift(A/B/C)` FROM package WHERE `SampleCreatedByShift(A/B/C)` IS NOT NULL');
-    const [cabinets] = await pool.execute('SELECT DISTINCT `Temporary Cabinet` FROM package WHERE `Temporary Cabinet` IS NOT NULL');
+    // Add caching headers for options (these don't change often)
+    res.set({
+      'Cache-Control': 'public, max-age=300',
+      'ETag': `options-${Date.now()}`
+    });
+
+    // Use Promise.all for parallel execution
+    const [
+      [categories],
+      [shifts],
+      [cabinets]
+    ] = await Promise.all([
+      pool.execute('SELECT DISTINCT Category FROM package WHERE Category IS NOT NULL ORDER BY Category'),
+      pool.execute('SELECT DISTINCT `SampleCreatedByShift(A/B/C)` FROM package WHERE `SampleCreatedByShift(A/B/C)` IS NOT NULL ORDER BY `SampleCreatedByShift(A/B/C)`'),
+      pool.execute('SELECT DISTINCT `Temporary Cabinet` FROM package WHERE `Temporary Cabinet` IS NOT NULL ORDER BY `Temporary Cabinet`')
+    ]);
 
     res.json({
       categories: categories.map(c => c.Category),
@@ -366,70 +404,91 @@ app.post('/api/borrow', authenticateToken, authorizeRole('Admin', 'Engineer'), a
     const { packageId, verifierId } = req.body;
     const borrowerId = req.user.id;
 
-    // Single optimized query to check package availability
-    const [packageInfo] = await pool.execute(
-      'SELECT * FROM package WHERE ID = ? AND `MATERIAL AT ENG ROOM` = \'YES\'',
-      [packageId]
-    );
+    // Start transaction for atomic operations
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    if (packageInfo.length === 0) {
-      return res.status(400).json({ message: 'Package not available for borrowing' });
+    try {
+      // Single optimized query to get all needed data
+      const [results] = await connection.execute(`
+        SELECT
+          p.ID as packageId, p.Packagecode, p.TotalSample,
+          b.ID as borrowerId, b.Email as borrowerEmail, b.Username as borrowerName,
+          v.ID as verifierId, v.Email as verifierEmail, v.Username as verifierName
+        FROM package p
+        CROSS JOIN user b
+        CROSS JOIN user v
+        WHERE p.ID = ? AND p.\`MATERIAL AT ENG ROOM\` = 'YES'
+          AND b.ID = ? AND v.ID = ?
+      `, [packageId, borrowerId, verifierId]);
+
+      if (results.length === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ message: 'Package not available or invalid user IDs' });
+      }
+
+      const data = results[0];
+      const dueDate = new Date();
+      dueDate.setHours(dueDate.getHours() + 24);
+
+      // Execute both updates in parallel within transaction
+      await Promise.all([
+        connection.execute('UPDATE package SET `MATERIAL AT ENG ROOM` = \'NO\' WHERE ID = ?', [packageId]),
+        connection.execute(`
+          INSERT INTO borrow_history (Package_ID, Borrower_ID, Verifier_ID, due_at, expected_samples, return_status)
+          VALUES (?, ?, ?, ?, ?, 'In Progress')
+        `, [packageId, borrowerId, verifierId, dueDate, data.TotalSample])
+      ]);
+
+      await connection.commit();
+      connection.release();
+
+      // Send response immediately
+      res.json({ message: 'Package borrowed successfully' });
+
+      // Send emails asynchronously in background - don't block response
+      if (process.env.EMAIL_USER) {
+        setImmediate(() => {
+          const borrowerEmail = {
+            from: process.env.EMAIL_USER,
+            to: data.borrowerEmail,
+            subject: 'Package Borrowed Successfully',
+            html: `
+              <h3>Package Borrowed</h3>
+              <p>You have successfully borrowed package: ${data.Packagecode}</p>
+              <p>Due date: ${dueDate.toLocaleString()}</p>
+              <p>Please return within 24 hours.</p>
+            `
+          };
+
+          const verifierEmail = {
+            from: process.env.EMAIL_USER,
+            to: data.verifierEmail,
+            subject: 'New Package to Verify',
+            html: `
+              <h3>Package Verification Assignment</h3>
+              <p>You have been assigned to verify package: ${data.Packagecode}</p>
+              <p>Borrowed by: ${data.borrowerName}</p>
+              <p>Due date: ${dueDate.toLocaleString()}</p>
+            `
+          };
+
+          // Fire and forget - don't await
+          Promise.all([
+            transporter.sendMail(borrowerEmail),
+            transporter.sendMail(verifierEmail)
+          ]).catch(error => {
+            console.error('Email sending error:', error);
+          });
+        });
+      }
+
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
     }
-
-    const dueDate = new Date();
-    dueDate.setHours(dueDate.getHours() + 24);
-
-    await pool.execute(
-      'UPDATE package SET `MATERIAL AT ENG ROOM` = \'NO\' WHERE ID = ?',
-      [packageId]
-    );
-
-    const [result] = await pool.execute(
-      `INSERT INTO borrow_history (Package_ID, Borrower_ID, Verifier_ID, due_at, expected_samples, return_status)
-       VALUES (?, ?, ?, ?, ?, 'In Progress')`,
-      [packageId, borrowerId, verifierId, dueDate, packageInfo[0].TotalSample]
-    );
-
-    const [borrower] = await pool.execute('SELECT * FROM user WHERE ID = ?', [borrowerId]);
-    const [verifier] = await pool.execute('SELECT * FROM user WHERE ID = ?', [verifierId]);
-
-    const borrowerEmail = {
-      from: process.env.EMAIL_USER,
-      to: borrower[0].Email,
-      subject: 'Package Borrowed Successfully',
-      html: `
-        <h3>Package Borrowed</h3>
-        <p>You have successfully borrowed package: ${packageInfo[0].Packagecode}</p>
-        <p>Due date: ${dueDate.toLocaleString()}</p>
-        <p>Please return within 24 hours.</p>
-      `
-    };
-
-    const verifierEmail = {
-      from: process.env.EMAIL_USER,
-      to: verifier[0].Email,
-      subject: 'New Package to Verify',
-      html: `
-        <h3>Package Verification Assignment</h3>
-        <p>You have been assigned to verify package: ${packageInfo[0].Packagecode}</p>
-        <p>Borrowed by: ${borrower[0].Username}</p>
-        <p>Due date: ${dueDate.toLocaleString()}</p>
-      `
-    };
-
-    // Send emails asynchronously without blocking the response
-    if (process.env.EMAIL_USER) {
-      // Fire and forget - don't await the email sending
-      Promise.all([
-        transporter.sendMail(borrowerEmail),
-        transporter.sendMail(verifierEmail)
-      ]).catch(error => {
-        console.error('Email sending error:', error);
-      });
-    }
-
-    // Respond immediately without waiting for emails
-    res.json({ message: 'Package borrowed successfully', borrowId: result.insertId });
   } catch (error) {
     console.error('Borrow error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -438,8 +497,17 @@ app.post('/api/borrow', authenticateToken, authorizeRole('Admin', 'Engineer'), a
 
 app.get('/api/borrow-history', authenticateToken, async (req, res) => {
   try {
+    // Add caching headers for better performance
+    res.set({
+      'Cache-Control': 'public, max-age=10',
+      'ETag': `history-${req.user.id}-${Date.now()}`
+    });
+
     let query = `
-      SELECT bh.*, p.Packagecode, p.Packagedescription,
+      SELECT bh.ID, bh.Package_ID, bh.Borrower_ID, bh.Verifier_ID,
+             bh.borrowed_at, bh.due_at, bh.return_status,
+             bh.expected_samples, bh.returned_samples, bh.justification,
+             p.Packagecode, p.Packagedescription,
              b.Username as BorrowerName, v.Username as VerifierName
       FROM borrow_history bh
       JOIN package p ON bh.Package_ID = p.ID
@@ -457,7 +525,7 @@ app.get('/api/borrow-history', authenticateToken, async (req, res) => {
       params.push(req.user.id);
     }
 
-    query += ' ORDER BY bh.borrowed_at DESC';
+    query += ' ORDER BY bh.borrowed_at DESC LIMIT 100';
 
     const [history] = await pool.execute(query, params);
     res.json(history);
@@ -497,34 +565,50 @@ app.post('/api/verify-return/:borrowId', authenticateToken, authorizeRole('Techn
     const borrowId = req.params.borrowId;
     const { returnedSamples, justification } = req.body;
 
-    const [borrowInfo] = await pool.execute(
-      'SELECT * FROM borrow_history WHERE ID = ? AND Verifier_ID = ?',
-      [borrowId, req.user.id]
-    );
+    // Start transaction for atomic operations
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    if (borrowInfo.length === 0) {
-      return res.status(404).json({ message: 'Verification record not found' });
-    }
+    try {
+      // Single query to get all needed data with validation
+      const [borrowInfo] = await connection.execute(`
+        SELECT bh.*, p.Packagecode
+        FROM borrow_history bh
+        JOIN package p ON bh.Package_ID = p.ID
+        WHERE bh.ID = ? AND bh.Verifier_ID = ? AND bh.return_status = 'Pending'
+      `, [borrowId, req.user.id]);
 
-    const expectedSamples = borrowInfo[0].expected_samples;
-    const status = parseInt(returnedSamples) === expectedSamples ? 'Returned' : 'Returned with Remarks';
+      if (borrowInfo.length === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(404).json({ message: 'Verification record not found or already processed' });
+      }
 
-    await pool.execute(
-      'UPDATE borrow_history SET returned_samples = ?, justification = ?, return_status = ? WHERE ID = ?',
-      [returnedSamples, justification, status, borrowId]
-    );
+      const data = borrowInfo[0];
+      const expectedSamples = data.expected_samples;
+      const status = parseInt(returnedSamples) === expectedSamples ? 'Returned' : 'Returned with Remarks';
 
-    await pool.execute(
-      'UPDATE package SET `MATERIAL AT ENG ROOM` = \'YES\' WHERE ID = ?',
-      [borrowInfo[0].Package_ID]
-    );
+      // Execute both updates in parallel within transaction
+      await Promise.all([
+        connection.execute(
+          'UPDATE borrow_history SET returned_samples = ?, justification = ?, return_status = ? WHERE ID = ?',
+          [returnedSamples, justification, status, borrowId]
+        ),
+        connection.execute(
+          'UPDATE package SET `MATERIAL AT ENG ROOM` = \'YES\' WHERE ID = ?',
+          [data.Package_ID]
+        )
+      ]);
 
-    // Send response immediately
-    res.json({ message: 'Return verified successfully' });
+      await connection.commit();
+      connection.release();
 
-    // Send emails asynchronously in the background (don't await)
-    if (status === 'Returned with Remarks') {
-      setImmediate(async () => {
+      // Send response immediately
+      res.json({ message: 'Return verified successfully' });
+
+      // Send emails asynchronously in the background (don't await)
+      if (status === 'Returned with Remarks') {
+        setImmediate(async () => {
         try {
           const [admins] = await pool.execute('SELECT Email FROM user WHERE Role = ?', ['Admin']);
 
@@ -554,6 +638,12 @@ app.post('/api/verify-return/:borrowId', authenticateToken, authorizeRole('Techn
           // Don't throw - this is background processing
         }
       });
+    }
+
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
     }
   } catch (error) {
     console.error('Verify return error:', error);
