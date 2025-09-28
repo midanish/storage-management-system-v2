@@ -11,6 +11,14 @@
       "dest": "/api/index.js"
     },
     {
+      "src": "^/static/(.*)",
+      "dest": "/frontend/public/static/$1"
+    },
+    {
+      "src": "^/(login|home|dashboard|packages|borrow|return|history)/?$",
+      "dest": "/frontend/public/index.html"
+    },
+    {
       "src": "/(.*)",
       "dest": "/frontend/public/$1"
     }
